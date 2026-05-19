@@ -52,7 +52,7 @@ To                         Action      From
 20022/tcp (v6)             ALLOW       Anywhere (v6)
 15034/tcp (v6)             ALLOW       Anywhere (v6)
 ```
-
+현업에서는 해커가 비밀번호를 5번 이상 틀리면 시스템이 알아서 그 해커의 IP를 방화벽 블랙리스트에 추가해 버리는 **Fail2Ban**이라는 자동화 프로그램을 이 방화벽(UFW)과 연동해서 씁니다.
 ---
 
 ## 3. 계정 / 그룹 / 권한 체계 구축 (Access Control)
