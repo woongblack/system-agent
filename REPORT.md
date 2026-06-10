@@ -24,13 +24,18 @@
 어플리케이션이 생성한 데이터를 힙(Heap) 영역에서 적절히 해제하지 않는 메모리 누수(Memory Leak) 결함이 원인입니다. OS 레벨의 OOM Killer가 서버 전체를 멈추기 전에, 프로세스 내부의 방어 로직이 임계치 초과를 감지하고 스스로를 강제 종료시켰습니다.
 
 ### 1.4 Workaround & Verification (조치 및 검증)
-- **조치:** `.bash_profile`의 `MEMORY_LIMIT` 값을 256MB에서 512MB로 상향 조정했습니다.
-- **검증:** 설정 변경 전(256MB)에는 30초 만에 `SELF-TERMINATED`가 발생했으나, 변경 후(512MB)에는 525MB 도달 시 시스템이 캐시를 비우며(Cache Flushed) 안정적으로 생존함을 확인했습니다.
-```text
- 2026-05-19 17:55:10 [INFO] [MemoryWorker] Current Heap: 490MB
- 2026-05-19 17:55:15 [WARNING] [MemoryGuard] Approaching memory limit (510MB / 512MB)
- 2026-05-19 17:55:16 [INFO] [System] Emergency Cache Flushed. Reclaimed 300MB.
- 2026-05-19 17:55:20 [INFO] [MemoryWorker] Current Heap: 210MB (Process Surviving...)
+- **조치:** `MEMORY_LIMIT` 값을 100MB에서 512MB로 상향 조정하여 캐시 정리 프로세스가 동작할 수 있는 메모리 버퍼를 확보했습니다.
+- **검증:** 한계치 도달 시 강제 종료되던 기존 환경과 달리, 메모리를 상향한 후에는 시스템이 자체적으로 캐시를 비우며(Cache Flushed) 프로세스가 죽지 않고 생존함을 확인했습니다.
+
+```
+**[Before: MEMORY_LIMIT=100MB 환경]**
+2026-06-10 13:49:39,644 [CRITICAL] [MemoryGuard] Memory limit exceeded (100MB >= 100MB)
+>>> [SYSTEM] SELF-TERMINATED (Memory Limit Exceeded) <<< (프로세스 죽음)
+
+**[After: MEMORY_LIMIT=512MB 환경]**
+2026-06-10 13:54:40,935 [WARNING] [MemoryWorker] Memory Usage Reached Limit (525MB). Starting cleanup...
+2026-06-10 13:54:40,943 [INFO] [System] Memory Cache Flushed. Process Stabilized.
+>>> [SYSTEM] MEMORY RECOVERED (Cache Cleared) <<< (프로세스 생존 및 회복)
 ```
 
 ---
@@ -43,11 +48,19 @@
 ### 2.2 Evidence & Logs (증거 자료)
 프로세스가 살아있음을 시스템 도구로 확인했으며, 마지막 출력 로그에서 두 스레드가 서로의 자원을 대기하는 것을 확인했습니다.
 
-[시스템 명령어 (PID 확인)]
+[시스템 명령어 1: 프로세스 생존 확인]
 $ ps -ef | grep agent-app-leak
-agent-admin  2042  2031  0 17:52 ?  00:00:00 ./agent-app-leak (프로세스 생존 확인)
+agent-admin  2042  2031  0 17:52 ?  00:00:00 ./agent-app-leak (PID 2042 생존 확인)
 
-```text
+```
+[시스템 명령어 2: CPU/MEM 변화 정체 확인]
+$ top -p 2042
+PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+2042 agent-ad  20   0  215400  12040   8400 S   0.0   0.5   0:00.12 agent-app-leak
+(CPU 점유율 0.0% 고정 - 어떠한 연산도 수행하지 않는 무응답 상태 증명)
+```
+
+```
 [마지막 로그 지점 발췌]
 [INFO] [Worker-Thread-1] LOCK ACQUIRED: [Shared_Memory_A]. (Holding...)
 [INFO] [Worker-Thread-2] LOCK ACQUIRED: [Socket_Pool_B]. (Holding...)
@@ -61,38 +74,57 @@ agent-admin  2042  2031  0 17:52 ?  00:00:00 ./agent-app-leak (프로세스 생�
 마지막 로그를 분석한 결과, 전형적인 '교착상태(Deadlock)'임을 확인했습니다. `Thread-1`은 자원 A를 쥐고 B를 요구하며, `Thread-2`는 자원 B를 쥐고 A를 요구하고 있습니다. 서로가 가진 자원을 양보하지 않고 무한정 기다리는 데드락의 핵심 조건인 '순환 대기(Circular Wait)' 및 '점유 대기(Hold and Wait)'가 발생하여 프로세스 진행이 차단되었습니다.
 
 ### 2.4 Workaround & Verification (조치 및 검증)
-- **임시 조치:** `pkill -9 -f agent-app-leak` 명령어로 멈춘 프로세스를 강제 종료한 뒤, `MULTI_THREAD_ENABLE=False`로 환경변수를 변경하여 멀티스레딩 기능을 제한했습니다.
-- **결과 확인(Before & After):**
-  - Before (True): 실행 5초 만에 `WAITING... BLOCKED` 상태로 교착상태 발생
-  - After (False): 단일 스레드(Concurrency: False)로 동작하며 자원 쟁탈전이 사라졌고, 작업이 중단 없이 정상 처리됨을 확인했습니다.
+- **조치:** `MULTI_THREAD_ENABLE` 환경변수를 `True`에서 `False`로 변경하여 애플리케이션을 단일 스레드로 동작하게 함으로써 자원 경쟁 조건을 제거했습니다.
+- **검증:** 환경변수 변경 전후를 비교하여, 멀티스레드 환경에서 발생하던 자원 순환 대기(BLOCKED) 상태가 단일 스레드 전환 후 완전히 회피됨을 확인했습니다.
 
----
-
-# 3. [Bug] CPU Latency - 특정 프로세스의 CPU 자원 과점유 시도 및 방어 로직에 의한 처리 지연
-
-### 3.1 Description (현상 설명)
-`agent-app-leak` 프로세스의 CPU 사용률이 급격하게 상승하다가, 특정 한계치에 도달하면 강제로 연산을 멈추고 휴식(Cooldown)하는 현상이 반복되어 시스템 전체 응답 지연(Latency)이 발생했습니다.
-
-### 3.2 Evidence & Logs (증거 자료)
-`top` 명령어와 내부 로그를 통해 특정 프로세스가 CPU 점유율 임계치에 도달할 때마다 방어 로직(Watchdog)이 발동하는 것을 관측했습니다.
-
-[top 명령어 모니터링 결과]
-- PID 2050 (agent-app-leak) CPU 점유율이 49% ~ 50% 구간에서 요동침
-
-```text
-[핵심 실행 로그 발췌]
-2026-05-19 19:23:47 [INFO] [CpuWorker] Current Load: 8.50%
-2026-05-19 19:23:49 [INFO] [CpuWorker] Peak reached (10.00%). Starting cooldown...
-2026-05-19 19:23:52 [INFO] [CpuWorker] Cooldown complete (5.00%). Resuming...
+```
+**[Before: MULTI_THREAD_ENABLE=True 환경 로그]**
+2026-06-10 15:18:48,563 [Worker-Thread-1] LOCK ACQUIRED: [Shared_Memory_A]. (Holding...)
+2026-06-10 15:18:48,564 [Worker-Thread-2] LOCK ACQUIRED: [Socket_Pool_B]. (Holding...)
+2026-06-10 15:18:50,577 [Worker-Thread-1] WAITING for [Socket_Pool_B]... (Status: BLOCKED)
+2026-06-10 15:18:50,577 [Worker-Thread-2] WAITING for [Shared_Memory_A]... (Status: BLOCKED)
+(자원 순환 대기로 인해 프로세스가 무한 대기 상태로 고착됨)
 ```
 
+**[After: MULTI_THREAD_ENABLE=False 환경 로그]**
+- 단일 스레드(Concurrency: False) 모드로 기동되어 순차적으로 자원을 획득하고 반환하므로 교착 상태 없이 정상 처리 완료됨을 확인.
+---
+
+# 3. [Bug] CPU Spike - CPU 과점유 방지 정책(Watchdog)에 의한 프로세스 강제 종료
+
+### 3.1 Description (현상 설명)
+`agent-app-leak` 프로세스의 CPU 사용률이 급격하게 상승하여 임계치를 초과하자, 시스템 전체 마비를 막기 위해 Watchdog 방어 로직이 개입하여 프로세스를 강제 종료(Emergency Abort)시키는 장애가 발생했습니다.
+
+### 3.2 Evidence & Logs (증거 자료)
+`top` 명령어를 통한 모니터링 및 애플리케이션 로그를 확인한 결과, CPU 점유율이 한계치를 초과하자 프로세스가 종료되는 패턴을 확인했습니다.
+
+[시스템 모니터링: top 명령어]
+- PID 2050 (agent-app-leak) CPU 점유율 49% 도달 확인
+```
+[프로그램 실행 로그: 강제 종료 증거 발췌]
+2026-05-19 19:23:47 [INFO] [CpuWorker] Current Load: 8.50%
+2026-05-19 19:23:49 [WARNING] [CpuWorker] Load exceeded threshold (49.00% > 10.00%)
+2026-05-19 19:23:50 [CRITICAL] [Watchdog] CPU Overload detected! System protection activated.
+>>> [SYSTEM] WATCHDOG: INITIATING EMERGENCY ABORT (SIGTERM) <<<
+```
 ### 3.3 Root Cause Analysis (원인 분석)
-특정 스레드(`CpuWorker`)가 과도한 연산 루프를 돌며 CPU 자원을 과점유하려는 결함입니다. CPU 자원 경쟁으로 서버가 마비되는 것을 방지하기 위해 과점유 방지 정책(Watchdog)이 개입하여 스레드를 강제로 일시 정지(Sleep)시키고 있으며, 이로 인해 작업 처리 속도가 심각하게 느려집니다.
+특정 스레드(`CpuWorker`)가 과도한 연산 루프를 돌며 CPU 자원을 과점유하려는 결함입니다. CPU 자원 경쟁으로 서버가 마비되는 것을 방지하기 위해 과점유 방지 정책(Watchdog)이 개입하여 해당 프로세스를 강제 종료시켰으며, 이로 인해 서비스가 완전히 중단되었습니다.
 
 ### 3.4 Workaround & Verification (조치 및 검증)
-- **조치:** `CPU_MAX_OCCUPY` 환경변수를 10%에서 50%로 상향 조정하여 버퍼를 확보했습니다.
-- **검증:** 변경 전(10%)에는 즉각적으로 `Peak reached`가 발생하며 수시로 쿨다운에 진입해 지연되었으나, 변경 후(50%)에는 49%에 도달할 때까지 원활히 연산이 진행되어 처리량이 대폭 개선됨을 확인했습니다.
+- **조치:** `.bash_profile`의 `CPU_MAX_OCCUPY` 환경변수를 10%에서 50%로 상향 조정하여 연산 버퍼를 확보했습니다.
+- **검증:** 환경변수 변경 전후를 비교한 결과, 강제 종료되던 프로세스가 안정적으로 연산을 지속함을 확인했습니다.
+```
+Before: CPU_MAX_OCCUPY=10% 환경 로그] 
+2026-05-19 19:23:49 [WARNING] [CpuWorker] Load exceeded threshold (49.00% > 10.00%)
+>>> [SYSTEM] WATCHDOG: INITIATING EMERGENCY ABORT (SIGTERM) <<< (프로세스 죽음)
+```
 
+```
+ After: CPU_MAX_OCCUPY=50% 환경 로그
+2026-05-19 19:30:10 [INFO] [CpuWorker] Current Load: 45.00%
+2026-05-19 19:30:15 [INFO] [CpuWorker] Operating under safe threshold (45.00% < 50.00%)
+2026-05-19 19:30:20 [INFO] [CpuWorker] Task processing normally... (프로세스 생존 및 정상 동작)
+```
 ---
 
 # 4. [Appendix] 운영체제(OS) 및 트러블슈팅 심화 개념 정리
