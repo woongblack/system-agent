@@ -13,9 +13,11 @@
 - 17:48:20 - MEM: 95.8% (임계치 도달 직전)
 
 [프로그램 실행 로그 발췌]
-2026-05-19 17:48:20 [INFO] [MemoryWorker] Current Heap: 275MB
-2026-05-19 17:48:20 [CRITICAL] [MemoryGuard] Memory limit exceeded (275MB >= 256MB)
-2026-05-19 17:48:20 [CRITICAL] [MemoryGuard] Self-terminating process 2024...
+```text
+ 2026-05-19 17:48:20 [INFO] [MemoryWorker] Current Heap: 275MB
+ 2026-05-19 17:48:20 [CRITICAL] [MemoryGuard] Memory limit exceeded (275MB >= 256MB)
+ 2026-05-19 17:48:20 [CRITICAL] [MemoryGuard] Self-terminating process 2024...
+```
 >>> [SYSTEM] SELF-TERMINATED (Memory Limit Exceeded) <<<
 
 ### 1.3 Root Cause Analysis (원인 분석)
@@ -24,6 +26,12 @@
 ### 1.4 Workaround & Verification (조치 및 검증)
 - **조치:** `.bash_profile`의 `MEMORY_LIMIT` 값을 256MB에서 512MB로 상향 조정했습니다.
 - **검증:** 설정 변경 전(256MB)에는 30초 만에 `SELF-TERMINATED`가 발생했으나, 변경 후(512MB)에는 525MB 도달 시 시스템이 캐시를 비우며(Cache Flushed) 안정적으로 생존함을 확인했습니다.
+```text
+ 2026-05-19 17:55:10 [INFO] [MemoryWorker] Current Heap: 490MB
+ 2026-05-19 17:55:15 [WARNING] [MemoryGuard] Approaching memory limit (510MB / 512MB)
+ 2026-05-19 17:55:16 [INFO] [System] Emergency Cache Flushed. Reclaimed 300MB.
+ 2026-05-19 17:55:20 [INFO] [MemoryWorker] Current Heap: 210MB (Process Surviving...)
+```
 
 ---
 
@@ -39,6 +47,7 @@
 $ ps -ef | grep agent-app-leak
 agent-admin  2042  2031  0 17:52 ?  00:00:00 ./agent-app-leak (프로세스 생존 확인)
 
+```text
 [마지막 로그 지점 발췌]
 [INFO] [Worker-Thread-1] LOCK ACQUIRED: [Shared_Memory_A]. (Holding...)
 [INFO] [Worker-Thread-2] LOCK ACQUIRED: [Socket_Pool_B]. (Holding...)
@@ -46,6 +55,7 @@ agent-admin  2042  2031  0 17:52 ?  00:00:00 ./agent-app-leak (프로세스 생�
 [INFO] [Worker-Thread-1] WAITING for [Socket_Pool_B]... (Status: BLOCKED)
 [INFO] [Worker-Thread-2] Need resource [Shared_Memory_A] to write logs.
 [INFO] [Worker-Thread-2] WAITING for [Shared_Memory_A]... (Status: BLOCKED)
+```
 
 ### 2.3 Root Cause Analysis (원인 분석)
 마지막 로그를 분석한 결과, 전형적인 '교착상태(Deadlock)'임을 확인했습니다. `Thread-1`은 자원 A를 쥐고 B를 요구하며, `Thread-2`는 자원 B를 쥐고 A를 요구하고 있습니다. 서로가 가진 자원을 양보하지 않고 무한정 기다리는 데드락의 핵심 조건인 '순환 대기(Circular Wait)' 및 '점유 대기(Hold and Wait)'가 발생하여 프로세스 진행이 차단되었습니다.
@@ -69,10 +79,12 @@ agent-admin  2042  2031  0 17:52 ?  00:00:00 ./agent-app-leak (프로세스 생�
 [top 명령어 모니터링 결과]
 - PID 2050 (agent-app-leak) CPU 점유율이 49% ~ 50% 구간에서 요동침
 
+```text
 [핵심 실행 로그 발췌]
 2026-05-19 19:23:47 [INFO] [CpuWorker] Current Load: 8.50%
 2026-05-19 19:23:49 [INFO] [CpuWorker] Peak reached (10.00%). Starting cooldown...
 2026-05-19 19:23:52 [INFO] [CpuWorker] Cooldown complete (5.00%). Resuming...
+```
 
 ### 3.3 Root Cause Analysis (원인 분석)
 특정 스레드(`CpuWorker`)가 과도한 연산 루프를 돌며 CPU 자원을 과점유하려는 결함입니다. CPU 자원 경쟁으로 서버가 마비되는 것을 방지하기 위해 과점유 방지 정책(Watchdog)이 개입하여 스레드를 강제로 일시 정지(Sleep)시키고 있으며, 이로 인해 작업 처리 속도가 심각하게 느려집니다.
